@@ -10,8 +10,10 @@
 #   - Added support for traffic analysis
 # 
 #  Usage:
-#   You will need to bind the address 2620:0:d20::1 to your machine "ip addr add 2620:0:d20::1/64 dev eth0"
-#   Run with: python3 mitm6.py -i eth0 -6 2620:0:d20::1 -v --debug
+#   You will need to bind an IPv6 address to your machine "ip addr add 2001:db8::1/64 dev eth0"
+#   It is preferable to use a global unicast address from your own address space.
+#   The example prefix 2001:db8::/32 is officially reserved for documentation, and might be deprioritised.
+#   Run with: python3 mitm6.py -i eth0 -v --debug
 #   Consider adding a domain whitelist
 #
 #  Tcpdump:
