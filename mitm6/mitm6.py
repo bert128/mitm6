@@ -1043,11 +1043,15 @@ def send_dns_reply(p):
         else:
             return
     elif dns.qd.qtype == 15:  # MX (Mail Exchange) record
-        # Return a stock MX record: mx.mitm6.internal with preference 10
+        # Return a stock MX record: mx.DOMAIN with preference 10
+        # Use the domain specified with -d if available, otherwise use mitm6.internal
         # For MX records, we need to manually construct the rdata bytes
         # MX record format: 2 bytes preference + domain name (compressed format)
         mx_preference = 10
-        mx_exchange = 'mx.mitm6.internal.'
+        if config.localdomain:
+            mx_exchange = 'mx.%s.' % config.localdomain
+        else:
+            mx_exchange = 'mx.mitm6.internal.'
         # Mark as MX record for special handling
         rdata = 'MX_RECORD'  # Special marker
     #Not handled
