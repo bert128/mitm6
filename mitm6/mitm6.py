@@ -531,6 +531,33 @@ def send_dhcp_pd_reply(p, basep):
     
     sendp(resp, iface=config.default_if, verbose=False)
 
+def encode_ipv4_to_nat64(ipv4_addr, nat64_prefix, nat64_length):
+    """Encode an IPv4 address into a NAT64 IPv6 address"""
+    try:
+        # Parse the NAT64 prefix
+        nat64_base = nat64_prefix.split('/')[0]
+        nat64_network = ipaddress.IPv6Network(nat64_prefix, strict=False)
+        
+        # Parse IPv4 address
+        ipv4_obj = ipaddress.IPv4Address(ipv4_addr)
+        ipv4_int = int(ipv4_obj)
+        
+        # For /96 or shorter prefixes, replace the last 32 bits with IPv4
+        if nat64_length <= 96:
+            # Get the network address as an integer
+            nat64_int = int(nat64_network.network_address)
+            # Clear the last 32 bits and add the IPv4 address
+            nat64_int = (nat64_int & 0xffffffffffffffffffffffff00000000) | ipv4_int
+            # Convert back to IPv6 address
+            return str(ipaddress.IPv6Address(nat64_int))
+        else:
+            # For longer prefixes, append IPv4 to the prefix
+            # This is less common but handle it anyway
+            ipv4_hex = format(ipv4_int, '08x')
+            return nat64_base + ':' + ipv4_hex[:4] + ':' + ipv4_hex[4:8]
+    except Exception:
+        return None
+
 def send_dns_reply(p):
     if IPv6 in p:
         ip = p[IPv6]
@@ -544,15 +571,19 @@ def send_dns_reply(p):
         return
     #Make sure the requested name is in unicode here
     reqname = dns.qd.qname.decode()
+    # Initialize response data variables
+    rdata = None
+    rdata_list = None
     #A request
     if dns.qd.qtype == 1:
         # Check if this is for ipv4only.arpa (NAT64)
         if reqname.endswith('ipv4only.arpa.'):
             if config.enable_pref64:
                 # For ipv4only.arpa, return the well-known IPv4 addresses
-                # These are hardcoded as per RFC 7050
+                # RFC 8880 specifies 192.0.0.170 and 192.0.0.171
                 if reqname == 'ipv4only.arpa.':
-                    rdata = '192.0.0.170'  # First IPv4 address
+                    # Return both IPv4 addresses - we'll send multiple RRs
+                    rdata_list = ['192.0.0.170', '192.0.0.171']
                 elif reqname == '170.0.0.192.in-addr.arpa.':
                     rdata = '192.0.0.170'  # Reverse lookup
                 elif reqname == '171.0.0.192.in-addr.arpa.':
@@ -751,12 +782,22 @@ def send_dns_reply(p):
         # Check if this is for ipv4only.arpa (NAT64)
         if reqname.endswith('ipv4only.arpa.'):
             if config.enable_pref64:
-                # For ipv4only.arpa, return the NAT64 IPv6 address
-                # This maps the IPv4 address to the NAT64 prefix
+                # For ipv4only.arpa, return the NAT64 IPv6 addresses
+                # RFC 8880: encode 192.0.0.170 and 192.0.0.171 into NAT64 IPv6 addresses
                 if reqname == 'ipv4only.arpa.':
-                    # Return the first IPv6 address in the NAT64 prefix
-                    nat64_base = config.nat64_prefix.split('/')[0]
-                    rdata = nat64_base
+                    # Return both IPv6 addresses with IPv4 encoded
+                    # RFC 8880: encode 192.0.0.170 and 192.0.0.171 into NAT64 IPv6 addresses
+                    ipv4_addrs = ['192.0.0.170', '192.0.0.171']
+                    rdata_list = []
+                    for ipv4_addr in ipv4_addrs:
+                        nat64_ipv6 = encode_ipv4_to_nat64(ipv4_addr, config.nat64_prefix, config.nat64_length)
+                        if nat64_ipv6:
+                            rdata_list.append(nat64_ipv6)
+                    if not rdata_list:
+                        # Fallback if encoding fails - use single record
+                        nat64_base = config.nat64_prefix.split('/')[0]
+                        rdata = nat64_base
+                        rdata_list = None
                 elif reqname.endswith('.in-addr.arpa.'):
                     # Extract IPv4 address from reverse lookup and map to NAT64
                     try:
@@ -765,24 +806,10 @@ def send_dns_reply(p):
                             octets = parts[:-3]
                             if len(octets) == 4:
                                 ipv4_addr = '.'.join(reversed(octets))
-                                # Map IPv4 to NAT64 prefix
-                                nat64_base = config.nat64_prefix.split('/')[0]
-                                # Convert IPv4 to hex and append to NAT64 prefix
-                                ipv4_parts = ipv4_addr.split('.')
-                                ipv4_hex = ''.join([format(int(part), '02x') for part in ipv4_parts])
-                                # Insert the IPv4 address into the NAT64 prefix
-                                if config.nat64_length <= 96:
-                                    # For /96 or shorter prefixes, replace the last 32 bits
-                                    nat64_parts = nat64_base.split(':')
-                                    if len(nat64_parts) >= 4:
-                                        # Replace the last 4 hex groups with the IPv4 address
-                                        nat64_parts[-4:] = [ipv4_hex[i:i+4] for i in range(0, 8, 2)]
-                                        rdata = ':'.join(nat64_parts)
-                                    else:
-                                        rdata = nat64_base
-                                else:
-                                    # For longer prefixes, append the IPv4 address
-                                    rdata = nat64_base + ':' + ipv4_hex[:4] + ':' + ipv4_hex[4:8]
+                                # Use helper function to encode IPv4 to NAT64 IPv6
+                                rdata = encode_ipv4_to_nat64(ipv4_addr, config.nat64_prefix, config.nat64_length)
+                                if not rdata:
+                                    rdata = config.selfaddr
                             else:
                                 rdata = config.selfaddr
                         else:
@@ -998,7 +1025,17 @@ def send_dns_reply(p):
     else:
         return
     if should_spoof_dns(reqname):
-        resp /= DNS(id=dns.id, qr=1, qd=dns.qd, an=DNSRR(rrname=dns.qd.qname, ttl=100, rdata=rdata, type=dns.qd.qtype))
+        # Check if we have multiple records (rdata_list) or a single record (rdata)
+        if rdata_list is not None and isinstance(rdata_list, list) and len(rdata_list) > 0:
+            # Build DNS response with multiple answer records
+            an_list = [DNSRR(rrname=dns.qd.qname, ttl=100, rdata=rdata_val, type=dns.qd.qtype) for rdata_val in rdata_list]
+            resp /= DNS(id=dns.id, qr=1, qd=dns.qd, an=an_list)
+        elif rdata is not None:
+            # Single record response
+            resp /= DNS(id=dns.id, qr=1, qd=dns.qd, an=DNSRR(rrname=dns.qd.qname, ttl=100, rdata=rdata, type=dns.qd.qtype))
+        else:
+            # No valid response data
+            return
         try:
             sendp(resp, iface=config.default_if, verbose=False)
         except socket.error as e:
@@ -1217,6 +1254,9 @@ def parsepacket(p):
                     flags.append('M (Managed)')
                 if hasattr(ra_layer, 'O') and ra_layer.O:
                     flags.append('O (Other)')
+                # Check for P flag (PREF64) in RA header (RFC 8781)
+                if hasattr(ra_layer, 'P') and ra_layer.P:
+                    flags.append('P (PREF64)')
                 if hasattr(ra_layer, 'chlim'):
                     flags.append('chlim: %d' % ra_layer.chlim)
                 if hasattr(ra_layer, 'routerlifetime'):
@@ -1270,6 +1310,156 @@ def parsepacket(p):
                             elif opt.type == 1:  # Source Link-Layer Address
                                 if hasattr(opt, 'lladdr'):
                                     ra_info.append('  Source LL: %s' % opt.lladdr)
+                            
+                            elif opt.type == 38 or opt.type == 138:  # PREF64 (RFC 8781: type 38, or 0x8A/138 for compatibility)
+                                # PREF64 option format (RFC 8781):
+                                # - Option Type: 1 byte
+                                # - Option Length: 1 byte (in units of 8 octets)
+                                # - Reserved: 4 bytes
+                                # - Prefix: 8 bytes (IPv6 prefix)
+                                # - Prefix Length: 1 byte
+                                try:
+                                    # Try to get raw option data
+                                    opt_data = None
+                                    if hasattr(opt, 'load'):
+                                        opt_data = opt.load
+                                    elif hasattr(opt, 'data'):
+                                        opt_data = opt.data
+                                    elif hasattr(opt, '__bytes__'):
+                                        # Try to get bytes representation and skip type/length header
+                                        try:
+                                            opt_bytes = bytes(opt)
+                                            if len(opt_bytes) >= 15:  # Type(1) + Length(1) + Reserved(4) + Prefix(8) + PrefixLen(1)
+                                                opt_data = opt_bytes[2:]  # Skip type and length bytes
+                                        except:
+                                            pass
+                                    
+                                    # If still no data, try to find in raw payload
+                                    if opt_data is None and Raw in p:
+                                        icmp_payload = p[Raw].load if Raw in p else None
+                                        if icmp_payload:
+                                            # Search for PREF64 option in payload (options start after 8-byte RA header)
+                                            opt_type = opt.type
+                                            # Start search from after RA header (8 bytes) if payload is full ICMPv6 message
+                                            start_offset = 8 if len(icmp_payload) > 8 else 0
+                                            i = start_offset
+                                            while i < len(icmp_payload) - 1:
+                                                if icmp_payload[i] == opt_type:
+                                                    opt_len = icmp_payload[i + 1] * 8  # Length in units of 8 octets
+                                                    if i + opt_len <= len(icmp_payload):
+                                                        opt_data = icmp_payload[i+2:i+opt_len]
+                                                        break
+                                                # Move to next option (options are aligned to 8-byte boundaries)
+                                                i += 8
+                                    
+                                    if opt_data and len(opt_data) >= 13:  # Minimum: 4 reserved + 8 prefix + 1 length
+                                        # Skip 4 reserved bytes, then 8 bytes for prefix, then 1 byte for prefix length
+                                        prefix_bytes = opt_data[4:12]  # 8 bytes for IPv6 prefix
+                                        prefix_len = opt_data[12]  # 1 byte for prefix length
+                                        
+                                        # Convert prefix bytes to IPv6 address string
+                                        try:
+                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, prefix_bytes)
+                                            ra_info.append('  PREF64: %s/%d' % (prefix_addr, prefix_len))
+                                        except (OSError, ValueError):
+                                            # Fallback: display as hex
+                                            prefix_hex = ':'.join(['%02x%02x' % (prefix_bytes[i], prefix_bytes[i+1]) for i in range(0, 8, 2)])
+                                            ra_info.append('  PREF64: %s/%d' % (prefix_hex, prefix_len))
+                                except Exception as e:
+                                    if config.verbose or config.debug:
+                                        ra_info.append('  PREF64: (parsing error: %s)' % str(e))
+                
+                # Also parse raw ICMPv6 payload directly for PREF64 options
+                # (scapy might not include unknown options in ra_layer.options)
+                try:
+                    # Get the ICMPv6 payload - options start after the 8-byte RA header
+                    icmp_payload = None
+                    # Try to get bytes from the ICMPv6 layer (this gives us the full RA message)
+                    try:
+                        icmp_bytes = bytes(p[ICMPv6ND_RA])
+                        if len(icmp_bytes) > 8:  # RA header is 8 bytes
+                            icmp_payload = icmp_bytes[8:]  # Options start after 8-byte header
+                    except:
+                        # Fallback: try Raw layer
+                        if Raw in p:
+                            raw_data = p[Raw].load
+                            # If Raw contains the full ICMPv6 message, skip the 8-byte RA header
+                            # Otherwise assume it's just the options
+                            if len(raw_data) > 8 and raw_data[0] == 134:  # ICMPv6 type 134 = RA
+                                icmp_payload = raw_data[8:]
+                            else:
+                                icmp_payload = raw_data
+                    
+                    if icmp_payload:
+                        # Search for PREF64 options (type 38 or 138) in the payload
+                        i = 0
+                        max_iterations = len(icmp_payload) // 8 + 1  # Safety limit
+                        iteration = 0
+                        prev_i = -1
+                        while i < len(icmp_payload) - 1 and iteration < max_iterations:
+                            iteration += 1
+                            if i + 1 >= len(icmp_payload):
+                                break
+                            opt_type = icmp_payload[i] if isinstance(icmp_payload, (bytes, bytearray)) else ord(icmp_payload[i])
+                            if opt_type in (38, 138):  # PREF64 option types
+                                opt_len_units = icmp_payload[i + 1] if isinstance(icmp_payload, (bytes, bytearray)) else ord(icmp_payload[i + 1])
+                                opt_len_bytes = opt_len_units * 8  # Length in units of 8 octets
+                                if opt_len_bytes > 0 and i + opt_len_bytes <= len(icmp_payload) and opt_len_bytes >= 16:
+                                    # Extract option data (skip type and length bytes)
+                                    opt_data = icmp_payload[i+2:i+opt_len_bytes]
+                                    if len(opt_data) >= 13:  # Minimum: 4 reserved + 8 prefix + 1 length
+                                        # Skip 4 reserved bytes, then 8 bytes for prefix, then 1 byte for prefix length
+                                        prefix_bytes = opt_data[4:12]  # 8 bytes for IPv6 prefix
+                                        prefix_len = opt_data[12] if isinstance(opt_data, (bytes, bytearray)) else ord(opt_data[12])  # 1 byte for prefix length
+                                        
+                                        # Convert prefix bytes to IPv6 address string
+                                        try:
+                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, bytes(prefix_bytes))
+                                            # Check if we already added this PREF64 (avoid duplicates)
+                                            pref64_found = False
+                                            for line in ra_info:
+                                                if 'PREF64:' in line and prefix_addr in line:
+                                                    pref64_found = True
+                                                    break
+                                            if not pref64_found:
+                                                ra_info.append('  PREF64: %s/%d' % (prefix_addr, prefix_len))
+                                        except (OSError, ValueError):
+                                            # Fallback: display as hex
+                                            prefix_bytes_list = [prefix_bytes[j] if isinstance(prefix_bytes, (bytes, bytearray)) else ord(prefix_bytes[j]) for j in range(0, 8)]
+                                            prefix_hex = ':'.join(['%02x%02x' % (prefix_bytes_list[j], prefix_bytes_list[j+1]) for j in range(0, 8, 2)])
+                                            pref64_found = False
+                                            for line in ra_info:
+                                                if 'PREF64:' in line and prefix_hex in line:
+                                                    pref64_found = True
+                                                    break
+                                            if not pref64_found:
+                                                ra_info.append('  PREF64: %s/%d' % (prefix_hex, prefix_len))
+                                # Move to next option (options are aligned to 8-byte boundaries)
+                                if opt_len_bytes > 0:
+                                    i = ((i + opt_len_bytes + 7) // 8) * 8
+                                else:
+                                    i += 8  # Safety: advance by at least 8 bytes
+                            else:
+                                # Move to next option (options are aligned to 8-byte boundaries)
+                                if i + 1 < len(icmp_payload):
+                                    opt_len_units = icmp_payload[i + 1] if isinstance(icmp_payload, (bytes, bytearray)) else ord(icmp_payload[i + 1])
+                                    opt_len_bytes = opt_len_units * 8
+                                    if opt_len_bytes > 0:
+                                        i = ((i + opt_len_bytes + 7) // 8) * 8
+                                    else:
+                                        i += 8  # Safety: advance by at least 8 bytes
+                                else:
+                                    break
+                            # Safety check: ensure we always advance
+                            if i == prev_i:
+                                i += 8  # Force advance if we didn't move
+                            prev_i = i
+                            if i >= len(icmp_payload):
+                                break
+                except Exception as e:
+                    if config.verbose or config.debug:
+                        if 'PREF64:' not in str(ra_info):
+                            ra_info.append('  PREF64: (raw parsing error: %s)' % str(e))
                 
                 # Print detailed information
                 for line in ra_info:
@@ -1311,31 +1501,65 @@ def send_ra():
         m_flag = 0 if config.no_managed else 1
         o_flag = 0 if config.no_other else 1
     
-    # Set PREF64 flag if enabled
+    # Set PREF64 flag if enabled (RFC 8781 defines P flag in RA header)
     pref64_flag = 1 if config.enable_pref64 else 0
     
+    # Create RA header
+    # Note: RFC 8781 defines a P flag (bit 4) in the RA header to indicate PREF64 options are present
+    # scapy's ICMPv6ND_RA doesn't directly support the P flag, so we'll set it manually if needed
     p /= ICMPv6ND_RA(M=m_flag, O=o_flag, chlim=64)
+    
     p /= ICMPv6NDOptPrefixInfo(type=3, prefixlen=64, preferredlifetime=600, validlifetime=600, prefix=config.ipv6prefix)
     p /= ICMPv6NDOptRouteInfo(prefix='::', plen=0, prf=8, rtlifetime=60)
     p /= ICMPv6NDOptRDNSS(lifetime=600, dns=[config.selfaddr])
     p /= ICMPv6NDOptMTU(mtu=1500)
     p /= ICMPv6NDOptSrcLLAddr(type=1, len=1, lladdr=config.macaddr)
     
-    # Add PREF64 option if enabled
+    # Add PREF64 option if enabled (RFC 8781)
     if config.enable_pref64:
-        # PREF64 option (RFC 8781) - indicates NAT64 prefix
-        # The PREF64 option is a custom ICMPv6 option that signals NAT64 capability
-        # We'll use a custom option type to implement this
-        pref64_data = struct.pack('!BBBB', 0x00, 0x00, 0x00, 0x00)  # Reserved fields
-        # Add the NAT64 prefix (first 8 bytes of the prefix)
+        # PREF64 option format (RFC 8781):
+        # - Option Type: 1 byte (38 = 0x26 per RFC 8781)
+        # - Option Length: 1 byte (in units of 8 octets)
+        # - Reserved: 2 bytes
+        # - Lifetime: 2 bytes (prefix lifetime in seconds)
+        # - Prefix: 8 bytes (IPv6 prefix)
+        # - Prefix Length: 1 byte
+        # Total data: 2 + 2 + 8 + 1 = 13 bytes
+        # Total option: 2 (type+length) + 13 = 15 bytes, rounded up to 16 bytes (2 units of 8 octets)
+        
+        # Lifetime (2 bytes) - default to 3600 seconds (0x0e10)
+        # Note: Some implementations put lifetime first, matching working router behavior
+        pref64_lifetime = 3600  # Default lifetime in seconds
+        pref64_data = struct.pack('!H', pref64_lifetime)  # Lifetime (2 bytes, big-endian)
+        # Reserved field (2 bytes)
+        pref64_data += struct.pack('!H', 0x0000)  # Reserved (2 bytes)
+        # Add the NAT64 prefix (8 bytes)
         prefix_bytes = socket.inet_pton(socket.AF_INET6, config.nat64_prefix.split('/')[0])
         pref64_data += prefix_bytes[:8]  # First 8 bytes of the prefix
-        # Add the prefix length
+        # Add the prefix length (1 byte)
         pref64_data += struct.pack('B', config.nat64_length)
         
-        # Create custom ICMPv6 option for PREF64
-        # Option type 0x8A is reserved for experimentation, we'll use it for PREF64
-        p /= Raw(load=struct.pack('BB', 0x8A, len(pref64_data) + 2)) / Raw(load=pref64_data)
+        # Calculate option length in units of 8 octets
+        # Total option size: 2 (type+length) + 13 (data) = 15 bytes
+        # Round up to next 8-byte boundary: 16 bytes = 2 units
+        opt_length = 2  # 16 bytes / 8 = 2 units
+        
+        # Create PREF64 option (RFC 8781: type 38 = 0x26)
+        # Use standard type 38 for RFC 8781 compliance
+        pref64_option = struct.pack('BB', 38, opt_length) + pref64_data
+        
+        # Pad to 8-byte boundary if needed (should be 16 bytes total)
+        # We have 2 (header) + 13 (data) = 15 bytes, need 16 bytes
+        if len(pref64_option) < 16:
+            pref64_option += b'\x00' * (16 - len(pref64_option))
+        
+        p /= Raw(load=pref64_option)
+        
+        # Note: RFC 8781 also defines a P flag (bit 4) in the RA header flags byte
+        # to indicate that PREF64 options are present. However, scapy's ICMPv6ND_RA
+        # doesn't directly support this flag. The PREF64 option itself is the required
+        # mechanism - the P flag is an optimization hint. Hosts should parse options
+        # to find PREF64 even without the P flag set.
     
     sendp(p, iface=config.default_if, verbose=False)
 
@@ -1647,6 +1871,9 @@ def check_existing_ipv6_router():
                     flags.append('M (Managed)')
                 if hasattr(ra_layer, 'O') and ra_layer.O:
                     flags.append('O (Other)')
+                # Check for P flag (PREF64) in RA header (RFC 8781)
+                if hasattr(ra_layer, 'P') and ra_layer.P:
+                    flags.append('P (PREF64)')
                 if hasattr(ra_layer, 'chlim'):
                     flags.append('chlim: %d' % ra_layer.chlim)
                 if hasattr(ra_layer, 'routerlifetime'):
@@ -1725,6 +1952,156 @@ def check_existing_ipv6_router():
                             elif opt.type == 1:  # Source Link-Layer Address
                                 if hasattr(opt, 'lladdr'):
                                     ra_info.append('  Source LL: %s' % opt.lladdr)
+                            
+                            elif opt.type == 38 or opt.type == 138:  # PREF64 (RFC 8781: type 38, or 0x8A/138 for compatibility)
+                                # PREF64 option format (RFC 8781):
+                                # - Option Type: 1 byte
+                                # - Option Length: 1 byte (in units of 8 octets)
+                                # - Reserved: 4 bytes
+                                # - Prefix: 8 bytes (IPv6 prefix)
+                                # - Prefix Length: 1 byte
+                                try:
+                                    # Try to get raw option data
+                                    opt_data = None
+                                    if hasattr(opt, 'load'):
+                                        opt_data = opt.load
+                                    elif hasattr(opt, 'data'):
+                                        opt_data = opt.data
+                                    elif hasattr(opt, '__bytes__'):
+                                        # Try to get bytes representation and skip type/length header
+                                        try:
+                                            opt_bytes = bytes(opt)
+                                            if len(opt_bytes) >= 15:  # Type(1) + Length(1) + Reserved(4) + Prefix(8) + PrefixLen(1)
+                                                opt_data = opt_bytes[2:]  # Skip type and length bytes
+                                        except:
+                                            pass
+                                    
+                                    # If still no data, try to find in raw payload
+                                    if opt_data is None and Raw in packet:
+                                        icmp_payload = packet[Raw].load if Raw in packet else None
+                                        if icmp_payload:
+                                            # Search for PREF64 option in payload (options start after 8-byte RA header)
+                                            opt_type = opt.type
+                                            # Start search from after RA header (8 bytes) if payload is full ICMPv6 message
+                                            start_offset = 8 if len(icmp_payload) > 8 else 0
+                                            i = start_offset
+                                            while i < len(icmp_payload) - 1:
+                                                if icmp_payload[i] == opt_type:
+                                                    opt_len = icmp_payload[i + 1] * 8  # Length in units of 8 octets
+                                                    if i + opt_len <= len(icmp_payload):
+                                                        opt_data = icmp_payload[i+2:i+opt_len]
+                                                        break
+                                                # Move to next option (options are aligned to 8-byte boundaries)
+                                                i += 8
+                                    
+                                    if opt_data and len(opt_data) >= 13:  # Minimum: 4 reserved + 8 prefix + 1 length
+                                        # Skip 4 reserved bytes, then 8 bytes for prefix, then 1 byte for prefix length
+                                        prefix_bytes = opt_data[4:12]  # 8 bytes for IPv6 prefix
+                                        prefix_len = opt_data[12]  # 1 byte for prefix length
+                                        
+                                        # Convert prefix bytes to IPv6 address string
+                                        try:
+                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, prefix_bytes)
+                                            ra_info.append('  PREF64: %s/%d' % (prefix_addr, prefix_len))
+                                        except (OSError, ValueError):
+                                            # Fallback: display as hex
+                                            prefix_hex = ':'.join(['%02x%02x' % (prefix_bytes[i], prefix_bytes[i+1]) for i in range(0, 8, 2)])
+                                            ra_info.append('  PREF64: %s/%d' % (prefix_hex, prefix_len))
+                                except Exception as e:
+                                    if config.verbose or config.debug:
+                                        ra_info.append('  PREF64: (parsing error: %s)' % str(e))
+                
+                # Also parse raw ICMPv6 payload directly for PREF64 options
+                # (scapy might not include unknown options in ra_layer.options)
+                try:
+                    # Get the ICMPv6 payload - options start after the 8-byte RA header
+                    icmp_payload = None
+                    # Try to get bytes from the ICMPv6 layer (this gives us the full RA message)
+                    try:
+                        icmp_bytes = bytes(packet[ICMPv6ND_RA])
+                        if len(icmp_bytes) > 8:  # RA header is 8 bytes
+                            icmp_payload = icmp_bytes[8:]  # Options start after 8-byte header
+                    except:
+                        # Fallback: try Raw layer
+                        if Raw in packet:
+                            raw_data = packet[Raw].load
+                            # If Raw contains the full ICMPv6 message, skip the 8-byte RA header
+                            # Otherwise assume it's just the options
+                            if len(raw_data) > 8 and raw_data[0] == 134:  # ICMPv6 type 134 = RA
+                                icmp_payload = raw_data[8:]
+                            else:
+                                icmp_payload = raw_data
+                    
+                    if icmp_payload:
+                        # Search for PREF64 options (type 38 or 138) in the payload
+                        i = 0
+                        max_iterations = len(icmp_payload) // 8 + 1  # Safety limit
+                        iteration = 0
+                        prev_i = -1
+                        while i < len(icmp_payload) - 1 and iteration < max_iterations:
+                            iteration += 1
+                            if i + 1 >= len(icmp_payload):
+                                break
+                            opt_type = icmp_payload[i] if isinstance(icmp_payload, (bytes, bytearray)) else ord(icmp_payload[i])
+                            if opt_type in (38, 138):  # PREF64 option types
+                                opt_len_units = icmp_payload[i + 1] if isinstance(icmp_payload, (bytes, bytearray)) else ord(icmp_payload[i + 1])
+                                opt_len_bytes = opt_len_units * 8  # Length in units of 8 octets
+                                if opt_len_bytes > 0 and i + opt_len_bytes <= len(icmp_payload) and opt_len_bytes >= 16:
+                                    # Extract option data (skip type and length bytes)
+                                    opt_data = icmp_payload[i+2:i+opt_len_bytes]
+                                    if len(opt_data) >= 13:  # Minimum: 4 reserved + 8 prefix + 1 length
+                                        # Skip 4 reserved bytes, then 8 bytes for prefix, then 1 byte for prefix length
+                                        prefix_bytes = opt_data[4:12]  # 8 bytes for IPv6 prefix
+                                        prefix_len = opt_data[12] if isinstance(opt_data, (bytes, bytearray)) else ord(opt_data[12])  # 1 byte for prefix length
+                                        
+                                        # Convert prefix bytes to IPv6 address string
+                                        try:
+                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, bytes(prefix_bytes))
+                                            # Check if we already added this PREF64 (avoid duplicates)
+                                            pref64_found = False
+                                            for line in ra_info:
+                                                if 'PREF64:' in line and prefix_addr in line:
+                                                    pref64_found = True
+                                                    break
+                                            if not pref64_found:
+                                                ra_info.append('  PREF64: %s/%d' % (prefix_addr, prefix_len))
+                                        except (OSError, ValueError):
+                                            # Fallback: display as hex
+                                            prefix_bytes_list = [prefix_bytes[j] if isinstance(prefix_bytes, (bytes, bytearray)) else ord(prefix_bytes[j]) for j in range(0, 8)]
+                                            prefix_hex = ':'.join(['%02x%02x' % (prefix_bytes_list[j], prefix_bytes_list[j+1]) for j in range(0, 8, 2)])
+                                            pref64_found = False
+                                            for line in ra_info:
+                                                if 'PREF64:' in line and prefix_hex in line:
+                                                    pref64_found = True
+                                                    break
+                                            if not pref64_found:
+                                                ra_info.append('  PREF64: %s/%d' % (prefix_hex, prefix_len))
+                                # Move to next option (options are aligned to 8-byte boundaries)
+                                if opt_len_bytes > 0:
+                                    i = ((i + opt_len_bytes + 7) // 8) * 8
+                                else:
+                                    i += 8  # Safety: advance by at least 8 bytes
+                            else:
+                                # Move to next option (options are aligned to 8-byte boundaries)
+                                if i + 1 < len(icmp_payload):
+                                    opt_len_units = icmp_payload[i + 1] if isinstance(icmp_payload, (bytes, bytearray)) else ord(icmp_payload[i + 1])
+                                    opt_len_bytes = opt_len_units * 8
+                                    if opt_len_bytes > 0:
+                                        i = ((i + opt_len_bytes + 7) // 8) * 8
+                                    else:
+                                        i += 8  # Safety: advance by at least 8 bytes
+                                else:
+                                    break
+                            # Safety check: ensure we always advance
+                            if i == prev_i:
+                                i += 8  # Force advance if we didn't move
+                            prev_i = i
+                            if i >= len(icmp_payload):
+                                break
+                except Exception as e:
+                    if config.verbose or config.debug:
+                        if 'PREF64:' not in str(ra_info):
+                            ra_info.append('  PREF64: (raw parsing error: %s)' % str(e))
                 
                 # Print detailed information
                 for line in ra_info:
