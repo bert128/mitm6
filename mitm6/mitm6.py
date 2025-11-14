@@ -22,7 +22,7 @@
 
 
 from __future__ import unicode_literals
-from scapy.all import sniff, ls, ARP, IPv6, DNS, DNSRR, Ether, conf, IP, UDP, Raw
+from scapy.all import sniff, ls, ARP, IPv6, DNS, DNSRR, Ether, conf, IP, UDP, Raw, ICMP
 from twisted.internet import reactor
 from twisted.internet.protocol import ProcessProtocol, DatagramProtocol
 from scapy.layers.dhcp6 import *
@@ -376,13 +376,26 @@ def send_dhcp_reply(p, basep):
     if config.localdomain:
         resp /= DHCP6OptDNSDomains(dnsdomains=[config.localdomain])
     try:
+        # Try to get the address option directly (for Request messages)
         opt = p[DHCP6OptIAAddress]
         resp /= DHCP6OptIA_NA(ianaopts=[opt], T1=200, T2=250, iaid=p[DHCP6OptIA_NA].iaid)
         sendp(resp, iface=config.default_if, verbose=False)
     except IndexError:
-        # Some hosts don't send back this layer for some reason, ignore those
-        if config.debug or config.verbose:
-            print('Ignoring DHCPv6 packet from %s: Missing DHCP6OptIAAddress layer' % basep.src)
+        # For Renew messages, the address is nested in IA_NA.ianaopts
+        try:
+            ia_na = p[DHCP6OptIA_NA]
+            if ia_na.ianaopts and len(ia_na.ianaopts) > 0:
+                # Use the address from the Renew request
+                opt = ia_na.ianaopts[0]
+                resp /= DHCP6OptIA_NA(ianaopts=[opt], T1=200, T2=250, iaid=ia_na.iaid)
+                sendp(resp, iface=config.default_if, verbose=False)
+            else:
+                if config.debug or config.verbose:
+                    print('Ignoring DHCPv6 packet from %s: IA_NA has no address options' % basep.src)
+        except (IndexError, KeyError, AttributeError):
+            # Some hosts don't send back this layer for some reason, ignore those
+            if config.debug or config.verbose:
+                print('Ignoring DHCPv6 packet from %s: Missing DHCP6OptIAAddress layer' % basep.src)
 
 def send_dhcp_pd_advertise(p, basep, target):
     """Send DHCPv6 Prefix Delegation Advertise message"""
@@ -1029,12 +1042,33 @@ def send_dns_reply(p):
                 return
         else:
             return
+    elif dns.qd.qtype == 15:  # MX (Mail Exchange) record
+        # Return a stock MX record: mx.mitm6.internal with preference 10
+        # For MX records, we need to manually construct the rdata bytes
+        # MX record format: 2 bytes preference + domain name (compressed format)
+        mx_preference = 10
+        mx_exchange = 'mx.mitm6.internal.'
+        # Mark as MX record for special handling
+        rdata = 'MX_RECORD'  # Special marker
     #Not handled
     else:
         return
     if should_spoof_dns(reqname):
+        # Check if this is an MX record (type 15) - handle it specially
+        if dns.qd.qtype == 15 and rdata == 'MX_RECORD':
+            # Create MX record by manually constructing the rdata bytes
+            # MX rdata format: preference (2 bytes, network byte order) + domain name
+            mx_bytes = struct.pack('!H', mx_preference)  # 2-byte preference in network byte order
+            # Add domain name in DNS label format (each label: length byte + label bytes, null-terminated)
+            for label in mx_exchange.rstrip('.').split('.'):
+                if label:  # Skip empty labels
+                    mx_bytes += bytes([len(label)]) + label.encode('utf-8')
+            mx_bytes += b'\x00'  # Null terminator for domain name
+            # Create DNSRR with the manually constructed rdata bytes
+            mx_rr = DNSRR(rrname=dns.qd.qname, ttl=100, rdata=mx_bytes, type=15)
+            resp /= DNS(id=dns.id, qr=1, qd=dns.qd, an=mx_rr)
         # Check if we have multiple records (rdata_list) or a single record (rdata)
-        if rdata_list is not None and isinstance(rdata_list, list) and len(rdata_list) > 0:
+        elif rdata_list is not None and isinstance(rdata_list, list) and len(rdata_list) > 0:
             # Build DNS response with multiple answer records
             an_list = [DNSRR(rrname=dns.qd.qname, ttl=100, rdata=rdata_val, type=dns.qd.qtype) for rdata_val in rdata_list]
             resp /= DNS(id=dns.id, qr=1, qd=dns.qd, an=an_list)
@@ -1146,7 +1180,13 @@ def parsepacket(p):
             try:
                 if p[DHCP6OptServerId].duid == config.selfduid and should_spoof_dhcpv6(target.host):
                     send_dhcp_reply(p[DHCP6_Renew],p)
-                    print('Renew reply sent to %s' % p[DHCP6OptIA_NA].ianaopts[0].addr)
+                    # Track the DHCPv6 address being renewed (ensure it's in the tracking set)
+                    try:
+                        dhcpv6_addr = p[DHCP6OptIA_NA].ianaopts[0].addr
+                        target.ipv6_dhcpv6.add(dhcpv6_addr)  # Add to set (no-op if already present)
+                        print('Renew reply sent to %s for %s' % (dhcpv6_addr, pcdict[p.src]))
+                    except (IndexError, KeyError):
+                        print('Renew reply sent to %s' % pcdict[p.src])
             except (IndexError, KeyError):
                 # Some DHCPv6 packets might not have ServerId option
                 pass
@@ -1433,18 +1473,22 @@ def parsepacket(p):
                                 if opt_len_bytes > 0 and i + opt_len_bytes <= len(icmp_payload) and opt_len_bytes >= 16:
                                     # Extract option data (skip type and length bytes)
                                     opt_data = icmp_payload[i+2:i+opt_len_bytes]
-                                    if len(opt_data) >= 13:  # Minimum: 4 reserved + 8 prefix + 1 length
-                                        # Skip 4 reserved bytes, then 8 bytes for prefix, then 1 byte for prefix length
-                                        prefix_bytes = opt_data[4:12]  # 8 bytes for IPv6 prefix
-                                        prefix_len = opt_data[12] if isinstance(opt_data, (bytes, bytearray)) else ord(opt_data[12])  # 1 byte for prefix length
+                                    if len(opt_data) >= 10:  # Minimum: 2 lifetime + 8 prefix
+                                        # PREF64 format: Lifetime (2 bytes) + Prefix (8 bytes) + Padding (remaining)
+                                        # NAT64 prefixes are always /96, so prefix length is not included in the option
+                                        prefix_bytes = opt_data[2:10]  # 8 bytes for IPv6 prefix (skip lifetime)
                                         
                                         # Convert prefix bytes to IPv6 address string
+                                        # Need to pad to 16 bytes for inet_ntop
                                         try:
-                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, bytes(prefix_bytes))
+                                            prefix_full = prefix_bytes + b'\x00' * 8  # Pad to 16 bytes
+                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, prefix_full)
+                                            # NAT64 prefixes are always /96
+                                            prefix_len = 96
                                             # Check if we already added this PREF64 (avoid duplicates)
                                             pref64_found = False
                                             for line in ra_info:
-                                                if 'PREF64:' in line and prefix_addr in line:
+                                                if 'PREF64:' in line and prefix_addr.split('::')[0] in line:
                                                     pref64_found = True
                                                     break
                                             if not pref64_found:
@@ -1459,7 +1503,7 @@ def parsepacket(p):
                                                     pref64_found = True
                                                     break
                                             if not pref64_found:
-                                                ra_info.append('  PREF64: %s/%d' % (prefix_hex, prefix_len))
+                                                ra_info.append('  PREF64: %s/96' % prefix_hex)
                                 # Move to next option (options are aligned to 8-byte boundaries)
                                 if opt_len_bytes > 0:
                                     i = ((i + opt_len_bytes + 7) // 8) * 8
@@ -2039,19 +2083,22 @@ def check_existing_ipv6_router():
                                                 # Move to next option (options are aligned to 8-byte boundaries)
                                                 i += 8
                                     
-                                    if opt_data and len(opt_data) >= 13:  # Minimum: 4 reserved + 8 prefix + 1 length
-                                        # Skip 4 reserved bytes, then 8 bytes for prefix, then 1 byte for prefix length
-                                        prefix_bytes = opt_data[4:12]  # 8 bytes for IPv6 prefix
-                                        prefix_len = opt_data[12]  # 1 byte for prefix length
+                                    if opt_data and len(opt_data) >= 10:  # Minimum: 2 lifetime + 8 prefix
+                                        # PREF64 format: Lifetime (2 bytes) + Prefix (8 bytes) + Padding (remaining)
+                                        # NAT64 prefixes are always /96, so prefix length is not included in the option
+                                        prefix_bytes = opt_data[2:10]  # 8 bytes for IPv6 prefix (skip lifetime)
                                         
                                         # Convert prefix bytes to IPv6 address string
+                                        # Need to pad to 16 bytes for inet_ntop
                                         try:
-                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, prefix_bytes)
-                                            ra_info.append('  PREF64: %s/%d' % (prefix_addr, prefix_len))
+                                            prefix_full = prefix_bytes + b'\x00' * 8  # Pad to 16 bytes
+                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, prefix_full)
+                                            # NAT64 prefixes are always /96
+                                            ra_info.append('  PREF64: %s/96' % prefix_addr)
                                         except (OSError, ValueError):
                                             # Fallback: display as hex
                                             prefix_hex = ':'.join(['%02x%02x' % (prefix_bytes[i], prefix_bytes[i+1]) for i in range(0, 8, 2)])
-                                            ra_info.append('  PREF64: %s/%d' % (prefix_hex, prefix_len))
+                                            ra_info.append('  PREF64: %s/96' % prefix_hex)
                                 except Exception as e:
                                     if config.verbose or config.debug:
                                         ra_info.append('  PREF64: (parsing error: %s)' % str(e))
@@ -2094,22 +2141,25 @@ def check_existing_ipv6_router():
                                 if opt_len_bytes > 0 and i + opt_len_bytes <= len(icmp_payload) and opt_len_bytes >= 16:
                                     # Extract option data (skip type and length bytes)
                                     opt_data = icmp_payload[i+2:i+opt_len_bytes]
-                                    if len(opt_data) >= 13:  # Minimum: 4 reserved + 8 prefix + 1 length
-                                        # Skip 4 reserved bytes, then 8 bytes for prefix, then 1 byte for prefix length
-                                        prefix_bytes = opt_data[4:12]  # 8 bytes for IPv6 prefix
-                                        prefix_len = opt_data[12] if isinstance(opt_data, (bytes, bytearray)) else ord(opt_data[12])  # 1 byte for prefix length
+                                    if len(opt_data) >= 10:  # Minimum: 2 lifetime + 8 prefix
+                                        # PREF64 format: Lifetime (2 bytes) + Prefix (8 bytes) + Padding (remaining)
+                                        # NAT64 prefixes are always /96, so prefix length is not included in the option
+                                        prefix_bytes = opt_data[2:10]  # 8 bytes for IPv6 prefix (skip lifetime)
                                         
                                         # Convert prefix bytes to IPv6 address string
+                                        # Need to pad to 16 bytes for inet_ntop
                                         try:
-                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, bytes(prefix_bytes))
+                                            prefix_full = prefix_bytes + b'\x00' * 8  # Pad to 16 bytes
+                                            prefix_addr = socket.inet_ntop(socket.AF_INET6, prefix_full)
+                                            # NAT64 prefixes are always /96
                                             # Check if we already added this PREF64 (avoid duplicates)
                                             pref64_found = False
                                             for line in ra_info:
-                                                if 'PREF64:' in line and prefix_addr in line:
+                                                if 'PREF64:' in line and prefix_addr.split('::')[0] in line:
                                                     pref64_found = True
                                                     break
                                             if not pref64_found:
-                                                ra_info.append('  PREF64: %s/%d' % (prefix_addr, prefix_len))
+                                                ra_info.append('  PREF64: %s/96' % prefix_addr)
                                         except (OSError, ValueError):
                                             # Fallback: display as hex
                                             prefix_bytes_list = [prefix_bytes[j] if isinstance(prefix_bytes, (bytes, bytearray)) else ord(prefix_bytes[j]) for j in range(0, 8)]
@@ -2120,7 +2170,7 @@ def check_existing_ipv6_router():
                                                     pref64_found = True
                                                     break
                                             if not pref64_found:
-                                                ra_info.append('  PREF64: %s/%d' % (prefix_hex, prefix_len))
+                                                ra_info.append('  PREF64: %s/96' % prefix_hex)
                                 # Move to next option (options are aligned to 8-byte boundaries)
                                 if opt_len_bytes > 0:
                                     i = ((i + opt_len_bytes + 7) // 8) * 8
