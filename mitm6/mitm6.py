@@ -571,6 +571,14 @@ def send_dns_reply(p):
         return
     #Make sure the requested name is in unicode here
     reqname = dns.qd.qname.decode()
+    
+    # Check for ipv4only.arpa queries and log them (IPv6-only mode detection)
+    if reqname.endswith('ipv4only.arpa.'):
+        if IPv6 in p:
+            print('*** IPv6-ONLY MODE DETECTED: Host %s (%s) queried %s' % (p.src, ip.src, reqname))
+        else:
+            print('*** IPv6-ONLY MODE DETECTED: Host %s (%s) queried %s' % (p.src, ip.src, reqname))
+    
     # Initialize response data variables
     rdata = None
     rdata_list = None
@@ -1044,6 +1052,24 @@ def send_dns_reply(p):
             if config.debug:
                 ls(resp)
         print('Sent spoofed reply for %s to %s' % (reqname, ip.src))
+        
+        # Track host based on DNS traffic - add to prefix hosts if source is in our prefix
+        if IPv6 in p:
+            try:
+                source_ipv6 = ipaddress.IPv6Address(ip.src)
+                if hasattr(config, 'ipv6prefix') and config.ipv6prefix:
+                    prefix_network = ipaddress.IPv6Network(config.ipv6prefix + '/64', strict=False)
+                    if source_ipv6 in prefix_network:
+                        # This host is using an address in our prefix - track it
+                        if p.src not in pcdict:
+                            pcdict[p.src] = Target(p.src, '')
+                        target = pcdict[p.src]
+                        # Add to SLAAC if not already tracked via DHCPv6
+                        if str(source_ipv6) not in target.ipv6_dhcpv6:
+                            if str(source_ipv6) not in target.ipv6_slaac:
+                                target.ipv6_slaac.add(str(source_ipv6))
+            except (ipaddress.AddressValueError, ValueError):
+                pass
     else:
         if config.verbose or config.debug:
             print('Ignored query for %s from %s' % (reqname, ip.src))
@@ -1528,16 +1554,17 @@ def send_ra():
         # Total option: 2 (type+length) + 13 = 15 bytes, rounded up to 16 bytes (2 units of 8 octets)
         
         # Lifetime (2 bytes) - default to 3600 seconds (0x0e10)
-        # Note: Some implementations put lifetime first, matching working router behavior
+        # Note: Matching working router format - lifetime first, then prefix, then padding
         pref64_lifetime = 3600  # Default lifetime in seconds
         pref64_data = struct.pack('!H', pref64_lifetime)  # Lifetime (2 bytes, big-endian)
-        # Reserved field (2 bytes)
-        pref64_data += struct.pack('!H', 0x0000)  # Reserved (2 bytes)
-        # Add the NAT64 prefix (8 bytes)
-        prefix_bytes = socket.inet_pton(socket.AF_INET6, config.nat64_prefix.split('/')[0])
-        pref64_data += prefix_bytes[:8]  # First 8 bytes of the prefix
-        # Add the prefix length (1 byte)
-        pref64_data += struct.pack('B', config.nat64_length)
+        # Add the NAT64 prefix (8 bytes) - use the network address
+        # For /96 prefix, we need the first 8 bytes (64 bits) of the network address
+        nat64_network = ipaddress.IPv6Network(config.nat64_prefix, strict=False)
+        prefix_bytes = nat64_network.network_address.packed[:8]  # First 8 bytes of network address
+        pref64_data += prefix_bytes  # 8 bytes
+        # Padding (3 bytes) to make total 13 bytes of data
+        # Note: Some implementations don't include prefix length byte, just padding
+        pref64_data += struct.pack('BBB', 0x00, 0x00, 0x00)  # 3 bytes padding
         
         # Calculate option length in units of 8 octets
         # Total option size: 2 (type+length) + 13 (data) = 15 bytes
@@ -1804,6 +1831,24 @@ def analyze_traffic(p):
             dst_ip,
             traffic_details
         ))
+        
+        # Track host based on traffic - add to prefix hosts if source is in our prefix
+        if ip_version == "IPv6":
+            try:
+                source_ipv6 = ipaddress.IPv6Address(src_ip)
+                if hasattr(config, 'ipv6prefix') and config.ipv6prefix:
+                    prefix_network = ipaddress.IPv6Network(config.ipv6prefix + '/64', strict=False)
+                    if source_ipv6 in prefix_network:
+                        # This host is using an address in our prefix - track it
+                        if p.src not in pcdict:
+                            pcdict[p.src] = Target(p.src, '')
+                        target = pcdict[p.src]
+                        # Add to SLAAC if not already tracked via DHCPv6
+                        if str(source_ipv6) not in target.ipv6_dhcpv6:
+                            if str(source_ipv6) not in target.ipv6_slaac:
+                                target.ipv6_slaac.add(str(source_ipv6))
+            except (ipaddress.AddressValueError, ValueError):
+                pass
         
     except Exception as e:
         if config.verbose or config.debug:
@@ -2194,6 +2239,27 @@ def report_ipv6_hosts():
         if hasattr(target, 'ipv6_link_local') and target.ipv6_link_local:
             link_local_hosts.append((mac, target, target.ipv6_link_local))
     
+    # Add mitm6 host to link-local addresses table if it has a link-local address
+    try:
+        self_ipv6 = ipaddress.IPv6Address(config.selfaddr)
+        if self_ipv6.is_link_local:
+            # Create a target entry for the mitm6 host if it doesn't exist
+            if config.selfmac not in pcdict:
+                pcdict[config.selfmac] = Target(config.selfmac, '')
+            mitm6_target = pcdict[config.selfmac]
+            if str(config.selfaddr) not in mitm6_target.ipv6_link_local:
+                mitm6_target.ipv6_link_local.add(str(config.selfaddr))
+            # Add to link_local_hosts if not already there
+            mitm6_found = False
+            for mac, target, addrs in link_local_hosts:
+                if mac == config.selfmac:
+                    mitm6_found = True
+                    break
+            if not mitm6_found:
+                link_local_hosts.append((config.selfmac, mitm6_target, mitm6_target.ipv6_link_local))
+    except (ipaddress.AddressValueError, ValueError, AttributeError):
+        pass
+    
     # Prepare output content
     output_lines = []
     
@@ -2271,7 +2337,16 @@ def report_ipv6_hosts():
         output_lines.append(separator)
         
         for mac, target, link_local_addrs in link_local_hosts:
-            hostname = target.host if target.host else 'Unknown'
+            # Check if this is the mitm6 host
+            if mac == config.selfmac:
+                # Get system hostname for mitm6 host
+                try:
+                    system_hostname = socket.gethostname()
+                    hostname = '%s (mitm6 host)' % system_hostname
+                except:
+                    hostname = 'mitm6 host'
+            else:
+                hostname = target.host if target.host else 'Unknown'
             
             # Display each link-local address on a separate line
             first_line = True
